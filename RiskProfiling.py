@@ -3,33 +3,38 @@
 import streamlit as st
 import pandas as pd
 import numpy as np
-import matplotlib.pyplot as plt
-import seaborn as sns
 import sqlite3
 import os
 import joblib
 from sklearn.model_selection import train_test_split
 from sklearn.preprocessing import StandardScaler
-from sklearn.linear_model import LogisticRegression
-from sklearn.metrics import classification_report, roc_auc_score, confusion_matrix, accuracy_score
+from sklearn.metrics import classification_report, roc_auc_score, accuracy_score
+import xgboost as xgb
 
 # Core Model Functions
 def load_data():
     uploaded_db = st.file_uploader("Upload SQLite Database (.db)", type=["db"], key="sql_db")
     if uploaded_db is not None:
         try:
-            conn = sqlite3.connect(uploaded_db.name)
-            # Fetch available table names
+            temp_path = os.path.join("temp_uploaded.db")
+            with open(temp_path, "wb") as f:
+                f.write(uploaded_db.read())
+
+            conn = sqlite3.connect(temp_path)
             tables = pd.read_sql("SELECT name FROM sqlite_master WHERE type='table';", conn)
             table_names = tables['name'].tolist()
 
             if not table_names:
                 st.error("❌ No tables found in database.")
+                conn.close()
+                os.remove(temp_path)
                 return None
 
             selected_table = st.selectbox("Select Table", table_names)
             df = pd.read_sql(f"SELECT * FROM {selected_table}", conn)
             conn.close()
+            os.remove(temp_path)
+
             st.success(f"✅ Loaded table: {selected_table}")
             return df
         except Exception as e:
@@ -38,21 +43,36 @@ def load_data():
         st.info("📥 Please upload a `.db` SQLite file.")
     return None
 
-# def load_data():
-#     conn = sqlite3.connect("customer_data.db")
-#     query = "SELECT * FROM customer_data"
-#     df = pd.read_sql(query, conn)
-#     conn.close()
-#     return df
+def suggest_features(df):
+    recommended_features = [
+        "credit_score", "income", "loan_amount", "employment_status",
+        "age", "payment_history", "num_late_payments", "total_due",
+        "total_paid", "account_age_months"
+    ]
+    missing = [feat for feat in recommended_features if feat not in df.columns]
+    if missing:
+        st.warning("⚠️ The following recommended features for better customer risk profiling are missing:")
+        for m in missing:
+            st.write(f"- {m}")
+        st.info("💡 Consider enriching your dataset with these features to improve model performance.")
+    else:
+        st.success("✅ Your dataset includes all key features recommended for customer risk profiling.")
 
 def preprocess(df):
-    df["payment_ratio"] = df["total_paid"] / (df["total_due"] + 1)
-    df["avg_delay_days"] = df["total_delay_days"] / (df["num_late_payments"] + 1)
     df.fillna(0, inplace=True)
 
-    features = ["total_paid", "total_due", "num_late_payments", "total_delay_days", "payment_ratio", "avg_delay_days"]
+    if "total_paid" in df.columns and "total_due" in df.columns:
+        df["payment_ratio"] = df["total_paid"] / (df["total_due"] + 1)
+    if "total_delay_days" in df.columns and "num_late_payments" in df.columns:
+        df["avg_delay_days"] = df["total_delay_days"] / (df["num_late_payments"] + 1)
+
+    target = "default" if "default" in df.columns else df.columns[-1]
+    features = [col for col in df.columns if col not in ["customer_id", "name", target]]
+
+    suggest_features(df)
+
     X = df[features]
-    y = df["default"]
+    y = df[target]
 
     scaler = StandardScaler()
     X_scaled = scaler.fit_transform(X)
@@ -61,53 +81,20 @@ def preprocess(df):
     return X_train, X_test, y_train, y_test, scaler, features
 
 def train_model(X, y):
-    model = LogisticRegression()
+    model = xgb.XGBClassifier(use_label_encoder=False, eval_metric='logloss')
     model.fit(X, y)
     return model
 
-import matplotlib.pyplot as plt
-import seaborn as sns
-from sklearn.metrics import classification_report, roc_auc_score, confusion_matrix, accuracy_score
-
-def evaluate_model(model, X_test, y_test, show_metrics=False):
-    if not show_metrics:
-        return
-
+def evaluate_model(model, X_test, y_test):
     y_pred = model.predict(X_test)
     y_proba = model.predict_proba(X_test)[:, 1]
-
-    auc = roc_auc_score(y_test, y_proba)
     acc = accuracy_score(y_test, y_pred)
-    cm = confusion_matrix(y_test, y_pred)
-
-    st.subheader("📊 Evaluation Metrics")
-    st.write("**🔍 Accuracy:**", round(acc, 3))
-    st.write("**📈 AUC-ROC:**", round(auc, 3))
-
-    st.subheader("🧾 Classification Report")
+    auc = roc_auc_score(y_test, y_proba)
+    st.write("🔍 **Accuracy:**", round(acc, 3))
+    st.write("📈 **AUC-ROC:**", round(auc, 3))
+    st.write("**Classification Report:**")
     st.text(classification_report(y_test, y_pred))
-
-    st.subheader("🔁 Confusion Matrix")
-    fig, ax = plt.subplots()
-    sns.heatmap(cm, annot=True, fmt="d", cmap="Blues", cbar=False, ax=ax,
-                xticklabels=["No Default", "Default"], yticklabels=["No Default", "Default"])
-    ax.set_xlabel("Predicted")
-    ax.set_ylabel("Actual")
-    st.pyplot(fig)
-
-# def evaluate_model(model, X_test, y_test):
-#     y_pred = model.predict(X_test)
-#     y_proba = model.predict_proba(X_test)[:, 1]
-    
-#     auc = roc_auc_score(y_test, y_proba)
-#     acc = accuracy_score(y_test, y_pred)
-    
-#     st.write("**🔍 Accuracy:**", round(acc, 3))
-#     st.write("**📈 AUC-ROC:**", round(auc, 3))
-#     st.write("**🧾 Classification Report:**")
-#     st.text(classification_report(y_test, y_pred))
-    
-#     return y_proba, pd.qcut(y_proba, q=4, labels=["Low", "Medium", "High", "Critical"])
+    return y_proba, pd.qcut(y_proba, q=4, labels=["Low", "Medium", "High", "Critical"])
 
 def predict_uploaded(model, scaler, features):
     uploaded_file = st.file_uploader("Upload CSV for Prediction", type=["csv"], key="predict_csv")
@@ -115,18 +102,18 @@ def predict_uploaded(model, scaler, features):
         df_new = pd.read_csv(uploaded_file)
         st.write("📋 Prediction Data Preview", df_new.head())
 
-        df_new["payment_ratio"] = df_new["total_paid"] / (df_new["total_due"] + 1)
-        df_new["avg_delay_days"] = df_new["total_delay_days"] / (df_new["num_late_payments"] + 1)
         df_new.fillna(0, inplace=True)
 
-        # Drop the 'default' column if it exists
+        if "total_paid" in df_new.columns and "total_due" in df_new.columns:
+            df_new["payment_ratio"] = df_new["total_paid"] / (df_new["total_due"] + 1)
+        if "total_delay_days" in df_new.columns and "num_late_payments" in df_new.columns:
+            df_new["avg_delay_days"] = df_new["total_delay_days"] / (df_new["num_late_payments"] + 1)
+
         df_new = df_new.drop(columns=["default"], errors="ignore")
 
-        # Use provided features or recalculate
         if not features:
             features = [col for col in df_new.columns if col not in ["customer_id", "name", "default"]]
 
-        # Make sure only those features are passed
         X_new = df_new[features]
         X_scaled = scaler.transform(X_new)
 
@@ -142,7 +129,6 @@ def collect_feedback():
     if st.sidebar.button("Submit Feedback"):
         st.sidebar.success("Thanks for your feedback!")
 
-# Save/Load Model Helpers
 def save_model(model, scaler):
     joblib.dump(model, "risk_model.joblib")
     joblib.dump(scaler, "scaler.joblib")
@@ -154,37 +140,32 @@ def load_model():
         return model, scaler
     return None, None
 
-# Streamlit App Logic
 def main():
     st.set_page_config(page_title="Customer Risk Profiler", layout="wide")
     st.title("📊 Customer Risk Profiling Model")
 
     st.sidebar.header("📁 Choose Data Source")
-    mode = st.sidebar.radio("Select mode", ["Use SQL Database for Training", "Upload CSV for Training", "Upload CSV for Prediction Only", ])
+    mode = st.sidebar.radio("Select mode", ["Use SQL Database", "Upload CSV for Training", "Upload CSV for Prediction Only"])
 
     model, scaler = load_model()
     features = []
 
-    if mode == "Use SQL Database for Training":
-        # if st.button("Load Data from SQL"):
-            try:
-                df = load_data()
+    if mode == "Use SQL Database":
+        try:
+            df = load_data()
+            if df is not None:
                 st.write("### Sample Data from SQL", df.head())
-
                 X_train, X_test, y_train, y_test, scaler, features = preprocess(df)
                 model = train_model(X_train, y_train)
                 save_model(model, scaler)
 
-                st.subheader("📈 Model Evaluation")
-                evaluate_model(model, X_test, y_test)
-                
-                #ModelStats
-                show_stats = st.button("📊 Show Model Stats")
-                evaluate_model(model, X_scaled, y, show_metrics=show_stats)
+                if st.button("📊 Show Model Stats"):
+                    st.subheader("📈 Model Evaluation")
+                    evaluate_model(model, X_test, y_test)
 
                 predict_uploaded(model, scaler, features)
-            except Exception as e:
-                st.error(f"❌ Failed to load data from database: {e}")
+        except Exception as e:
+            st.error(f"❌ Failed to load data from database: {e}")
 
     elif mode == "Upload CSV for Training":
         uploaded_train = st.file_uploader("Upload CSV with labels", type=["csv"], key="train_csv")
@@ -192,51 +173,36 @@ def main():
             df = pd.read_csv(uploaded_train)
             st.write("📋 Training Data Preview", df.head())
 
-            if "default" not in df.columns:
-                st.error("CSV must include 'default' column as target.")
-            else: #FeatureEngineering
+            df.fillna(0, inplace=True)
+
+            if "total_paid" in df.columns and "total_due" in df.columns:
                 df["payment_ratio"] = df["total_paid"] / (df["total_due"] + 1)
+            if "total_delay_days" in df.columns and "num_late_payments" in df.columns:
                 df["avg_delay_days"] = df["total_delay_days"] / (df["num_late_payments"] + 1)
-                df.fillna(0, inplace=True)
 
-                features = [col for col in df.columns if col not in ["customer_id", "name", "default"]]
-                X = df[features]
-                y = df["default"]
-                scaler = StandardScaler()
-                X_scaled = scaler.fit_transform(X)
+            suggest_features(df)
 
-                model = train_model(X_scaled, y)
-                save_model(model, scaler)
-                st.success("✅ Model trained and saved.")
-                
-                #ModelStats
-                show_stats = st.button("📊 Show Model Stats")
-                evaluate_model(model, X_scaled, y, show_metrics=show_stats)
+            target = "default" if "default" in df.columns else df.columns[-1]
+            features = [col for col in df.columns if col not in ["customer_id", "name", target]]
+            X = df[features]
+            y = df[target]
+            scaler = StandardScaler()
+            X_scaled = scaler.fit_transform(X)
 
-                st.write("You can now use 'Upload CSV for Prediction Only'.")
+            model = train_model(X_scaled, y)
+            save_model(model, scaler)
+            st.success(f"✅ Model trained using target: `{target}`")
+
+            if st.button("📊 Show Model Stats"):
+                st.subheader("📈 Model Evaluation")
+                X_train, X_test, y_train, y_test = train_test_split(X_scaled, y, test_size=0.2, random_state=42)
+                evaluate_model(model, X_test, y_test)
 
     elif mode == "Upload CSV for Prediction Only":
         if model is None or scaler is None:
             st.warning("⚠️ No model found. Please train one first.")
         else:
             predict_uploaded(model, scaler, None)
-
-    elif mode == "Use SQL Database for Training":
-        try:
-            df = load_data()
-            if df is not None:
-                st.write("### Sample Data from SQL", df.head())
-
-                X_train, X_test, y_train, y_test, scaler, features = preprocess(df)
-                model = train_model(X_train, y_train)
-                save_model(model, scaler)
-
-                show_stats = st.button("📊 Show Model Stats")
-                evaluate_model(model, X_test, y_test, show_metrics=show_stats)
-
-                predict_uploaded(model, scaler, features)
-        except Exception as e:
-            st.error(f"❌ Failed to load data from database: {e}")
 
     collect_feedback()
 
