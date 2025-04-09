@@ -1,8 +1,6 @@
-# You’re giving the model the question paper — not the answer key
-
 import streamlit as st
 import pandas as pd
-# import numpy as np
+import numpy as np
 import sqlite3
 import os
 import joblib
@@ -16,25 +14,17 @@ def load_data():
     uploaded_db = st.file_uploader("Upload SQLite Database (.db)", type=["db"], key="sql_db")
     if uploaded_db is not None:
         try:
-            temp_path = os.path.join("temp_uploaded.db")
-            with open(temp_path, "wb") as f:
-                f.write(uploaded_db.read())
-
-            conn = sqlite3.connect(temp_path)
+            conn = sqlite3.connect(uploaded_db.name)
             tables = pd.read_sql("SELECT name FROM sqlite_master WHERE type='table';", conn)
             table_names = tables['name'].tolist()
 
             if not table_names:
                 st.error("❌ No tables found in database.")
-                conn.close()
-                os.remove(temp_path)
                 return None
 
             selected_table = st.selectbox("Select Table", table_names)
             df = pd.read_sql(f"SELECT * FROM {selected_table}", conn)
             conn.close()
-            os.remove(temp_path)
-
             st.success(f"✅ Loaded table: {selected_table}")
             return df
         except Exception as e:
@@ -43,36 +33,14 @@ def load_data():
         st.info("📥 Please upload a `.db` SQLite file.")
     return None
 
-def suggest_features(df):
-    recommended_features = [
-        "credit_score", "income", "loan_amount", "employment_status",
-        "age", "payment_history", "num_late_payments", "total_due",
-        "total_paid", "account_age_months"
-    ]
-    missing = [feat for feat in recommended_features if feat not in df.columns]
-    if missing:
-        st.warning("⚠️ The following recommended features for better customer risk profiling are missing:")
-        for m in missing:
-            st.write(f"- {m}")
-        st.info("💡 Consider enriching your dataset with these features to improve model performance.")
-    else:
-        st.success("✅ Your dataset includes all key features recommended for customer risk profiling.")
-
 def preprocess(df):
+    df["payment_ratio"] = df["total_paid"] / (df["total_due"] + 1)
+    df["avg_delay_days"] = df["total_delay_days"] / (df["num_late_payments"] + 1)
     df.fillna(0, inplace=True)
 
-    if "total_paid" in df.columns and "total_due" in df.columns:
-        df["payment_ratio"] = df["total_paid"] / (df["total_due"] + 1)
-    if "total_delay_days" in df.columns and "num_late_payments" in df.columns:
-        df["avg_delay_days"] = df["total_delay_days"] / (df["num_late_payments"] + 1)
-
-    target = "default" if "default" in df.columns else df.columns[-1]
-    features = [col for col in df.columns if col not in ["customer_id", "name", target]]
-
-    suggest_features(df)
-
+    features = ["total_paid", "total_due", "num_late_payments", "total_delay_days", "payment_ratio", "avg_delay_days"]
     X = df[features]
-    y = df[target]
+    y = df["default"]
 
     scaler = StandardScaler()
     X_scaled = scaler.fit_transform(X)
@@ -102,12 +70,9 @@ def predict_uploaded(model, scaler, features):
         df_new = pd.read_csv(uploaded_file)
         st.write("📋 Prediction Data Preview", df_new.head())
 
+        df_new["payment_ratio"] = df_new["total_paid"] / (df_new["total_due"] + 1)
+        df_new["avg_delay_days"] = df_new["total_delay_days"] / (df_new["num_late_payments"] + 1)
         df_new.fillna(0, inplace=True)
-
-        if "total_paid" in df_new.columns and "total_due" in df_new.columns:
-            df_new["payment_ratio"] = df_new["total_paid"] / (df_new["total_due"] + 1)
-        if "total_delay_days" in df_new.columns and "num_late_payments" in df_new.columns:
-            df_new["avg_delay_days"] = df_new["total_delay_days"] / (df_new["num_late_payments"] + 1)
 
         df_new = df_new.drop(columns=["default"], errors="ignore")
 
@@ -145,12 +110,12 @@ def main():
     st.title("📊 Customer Risk Profiling Model")
 
     st.sidebar.header("📁 Choose Data Source")
-    mode = st.sidebar.radio("Select mode", ["Use SQL Database", "Upload CSV for Training", "Upload CSV for Prediction Only"])
+    mode = st.sidebar.radio("Select mode", ["Use SQL Database for Training", "Upload CSV for Training", "Upload CSV for Prediction Only"])
 
     model, scaler = load_model()
     features = []
 
-    if mode == "Use SQL Database":
+    if mode == "Use SQL Database for Training":
         try:
             df = load_data()
             if df is not None:
@@ -173,30 +138,27 @@ def main():
             df = pd.read_csv(uploaded_train)
             st.write("📋 Training Data Preview", df.head())
 
-            df.fillna(0, inplace=True)
-
-            if "total_paid" in df.columns and "total_due" in df.columns:
+            if "default" not in df.columns:
+                st.error("CSV must include 'default' column as target.")
+            else:
                 df["payment_ratio"] = df["total_paid"] / (df["total_due"] + 1)
-            if "total_delay_days" in df.columns and "num_late_payments" in df.columns:
                 df["avg_delay_days"] = df["total_delay_days"] / (df["num_late_payments"] + 1)
+                df.fillna(0, inplace=True)
 
-            suggest_features(df)
+                features = [col for col in df.columns if col not in ["customer_id", "name", "default"]]
+                X = df[features]
+                y = df["default"]
+                scaler = StandardScaler()
+                X_scaled = scaler.fit_transform(X)
 
-            target = "default" if "default" in df.columns else df.columns[-1]
-            features = [col for col in df.columns if col not in ["customer_id", "name", target]]
-            X = df[features]
-            y = df[target]
-            scaler = StandardScaler()
-            X_scaled = scaler.fit_transform(X)
+                model = train_model(X_scaled, y)
+                save_model(model, scaler)
+                st.success("✅ Model trained and saved.")
 
-            model = train_model(X_scaled, y)
-            save_model(model, scaler)
-            st.success(f"✅ Model trained using target: `{target}`")
-
-            if st.button("📊 Show Model Stats"):
-                st.subheader("📈 Model Evaluation")
-                X_train, X_test, y_train, y_test = train_test_split(X_scaled, y, test_size=0.2, random_state=42)
-                evaluate_model(model, X_test, y_test)
+                if st.button("📊 Show Model Stats"):
+                    st.subheader("📈 Model Evaluation")
+                    X_train, X_test, y_train, y_test = train_test_split(X_scaled, y, test_size=0.2, random_state=42)
+                    evaluate_model(model, X_test, y_test)
 
     elif mode == "Upload CSV for Prediction Only":
         if model is None or scaler is None:
